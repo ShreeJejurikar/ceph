@@ -527,7 +527,7 @@ def _kafka_cert_dir():
 
 class KafkaReceiver(object):
     """class for receiving and storing messages on a topic from the kafka broker"""
-    def __init__(self, topic_name, security_type, kafka_server, mechanism='PLAIN'):
+    def __init__(self, topic_name, security_type, kafka_server, mechanism='PLAIN', replication_factor=1):
         from kafka import KafkaConsumer
         from kafka.admin import KafkaAdminClient, NewTopic
         from kafka.errors import TopicAlreadyExistsError
@@ -597,7 +597,15 @@ class KafkaReceiver(object):
                 admin_client = KafkaAdminClient(
                         request_timeout_ms=16000,
                         **base_config)
-                topic = NewTopic(name=topic_name, num_partitions=1, replication_factor=1)
+                topic_configs = {}
+                if replication_factor >= 2:
+                    topic_configs['min.insync.replicas'] = str(max(1, replication_factor - 1))
+                topic = NewTopic(
+                    name=topic_name,
+                    num_partitions=1,
+                    replication_factor=replication_factor,
+                    topic_configs=topic_configs if topic_configs else None,
+                )
                 admin_client.create_topics([topic])
                 log.info('Kafka admin created topic: %s on broker/s: %s', topic_name, endpoint)
                 break
@@ -631,7 +639,7 @@ class KafkaReceiver(object):
                 break
             except Exception as error:
                 remaining_retries -= 1
-                log.warning('Kafka consumer failed to connect to broker/s: %s. for topic: %. remaining reties: %d. error: %s',
+                log.warning('Kafka consumer failed to connect to broker/s: %s. for topic: %s. remaining reties: %d. error: %s',
                             endpoint, topic_name,  remaining_retries, str(error))
                 time.sleep(1)
 
@@ -672,9 +680,9 @@ def kafka_receiver_thread_runner(receiver):
     receiver.status = 'ended'
 
 
-def create_kafka_receiver_thread(topic, security_type='PLAINTEXT', kafka_brokers=None, mechanism='PLAIN'):
+def create_kafka_receiver_thread(topic, security_type='PLAINTEXT', kafka_brokers=None, mechanism='PLAIN', replication_factor=1):
     """create kafka receiver and thread"""
-    receiver = KafkaReceiver(topic, security_type, kafka_server=kafka_brokers, mechanism=mechanism)
+    receiver = KafkaReceiver(topic, security_type, kafka_server=kafka_brokers, mechanism=mechanism, replication_factor=replication_factor)
     task = threading.Thread(target=kafka_receiver_thread_runner, args=(receiver,))
     task.daemon = True
     return task, receiver
@@ -709,6 +717,70 @@ def verify_kafka_receiver(receiver):
     assert len(events) == 1
     assert 'test' in events[0]
     log.info('Kafka receiver on topic: %s tested ok', receiver.topic)
+
+def _get_kafka_dir_or_raise():
+    kafka_dir = os.environ.get('KAFKA_DIR')
+    if not kafka_dir:
+        raise RuntimeError('KAFKA_DIR not set; cannot manage individual brokers')
+    return kafka_dir
+
+def get_broker_pid(broker_id):
+    """find the PID of a running broker by matching its config file path"""
+    kafka_dir = _get_kafka_dir_or_raise()
+    config_path = os.path.join(kafka_dir, 'config', 'kafka{}.properties'.format(broker_id))
+    cmd = "ps -ef | grep '[k]afka{}.properties' | awk '{{print $2}}'".format(broker_id)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+    pid = result.stdout.strip()
+    if not pid:
+        raise RuntimeError(
+            'no running process found for broker {} (config: {})'.format(broker_id, config_path)
+        )
+    if len(pid.splitlines()) > 1:
+        raise RuntimeError(
+            'multiple PIDs matched broker {}: {}'.format(broker_id, pid)
+        )
+    return int(pid)
+
+def kill_broker_hard(broker_id):
+    """SIGKILL a broker process, simulating an ungraceful crash"""
+    pid = get_broker_pid(broker_id)
+    log.info('Hard-killing broker %d (pid %d)', broker_id, pid)
+    subprocess.run(['kill', '-9', str(pid)], check=True, timeout=10)
+    # give the controller a moment to detect the failure via missed heartbeats
+    time.sleep(1)
+
+def start_broker(broker_id, wait_secs=5):
+    """restart a previously-stopped broker"""
+    kafka_dir = _get_kafka_dir_or_raise()
+    config_path = os.path.join(kafka_dir, 'config', 'kafka{}.properties'.format(broker_id))
+    log.info('Starting broker %d (config: %s)', broker_id, config_path)
+    subprocess.run(
+        [os.path.join(kafka_dir, 'bin', 'kafka-server-start.sh'), '-daemon', config_path],
+        check=True, timeout=30,
+    )
+    time.sleep(wait_secs)  # let it rejoin the cluster / catch up as a follower
+
+def get_partition_leader(bootstrap_servers, topic, partition=0):
+    """query the current leader broker id for a topic-partition via kafka-topics.sh"""
+    kafka_dir = _get_kafka_dir_or_raise()
+    result = subprocess.run(
+        [
+            os.path.join(kafka_dir, 'bin', 'kafka-topics.sh'),
+            '--describe', '--topic', topic,
+            '--bootstrap-server', bootstrap_servers,
+        ],
+        capture_output=True, text=True, timeout=15, check=True,
+    )
+    for line in result.stdout.splitlines():
+        if 'Partition: {}'.format(partition) in line and 'Leader:' in line:
+            for token in line.split():
+                if token.startswith('Leader:'):
+                    return int(line.split('Leader:')[1].split()[0])
+    raise RuntimeError(
+        'could not determine leader for topic {} partition {}. output: {}'.format(
+            topic, partition, result.stdout
+        )
+    )
 
 
 def connection(no_retries=False):
@@ -1519,7 +1591,7 @@ def test_notification_errors():
     conn.delete_bucket(bucket_name)
 
 
-def notification(endpoint_type, conn, account=None, cloudevents=False, kafka_brokers=None):
+def notification(endpoint_type, conn, account=None, cloudevents=False, kafka_brokers=None, replication_factor=1):
     """ test pushinging notification """
     zonegroup = get_config_zonegroup()
     # create bucket
@@ -1577,7 +1649,7 @@ def notification(endpoint_type, conn, account=None, cloudevents=False, kafka_bro
         default_kafka_server_and_port = default_kafka_server + ':9092'
         if kafka_brokers is not None:
             kafka_brokers = kafka_brokers + ',' + default_kafka_server_and_port
-        task, receiver = create_kafka_receiver_thread(topic_name, kafka_brokers=kafka_brokers)
+        task, receiver = create_kafka_receiver_thread(topic_name, kafka_brokers=kafka_brokers, replication_factor=replication_factor)
         task.start()
         verify_kafka_receiver(receiver)
         endpoint_address = 'kafka://' + default_kafka_server_and_port
@@ -1804,14 +1876,209 @@ def test_notification_kafka():
 def test_notification_kafka_multiple_brokers_override():
     """ test pushing kafka notification """
     conn = connection()
-    notification('kafka', conn, kafka_brokers='{host}:9091,{host}:9092'.format(host=default_kafka_server))
+    notification('kafka', conn, kafka_brokers='{host}:9091,{host}:9092'.format(host=default_kafka_server), replication_factor=1)
 
 
 @pytest.mark.kafka_failover
 def test_notification_kafka_multiple_brokers_append():
     """ test pushing kafka notification """
     conn = connection()
-    notification('kafka', conn, kafka_brokers='{host}:9091'.format(host=default_kafka_server))
+    notification('kafka', conn, kafka_brokers='{host}:9091'.format(host=default_kafka_server), replication_factor=1)
+
+
+@pytest.mark.kafka_failover
+def test_kafka_broker_failover():
+    """ test notification delivery after the partition leader is killed """
+    broker_ids_str = os.environ.get('KAFKA_BROKER_IDS', '')
+    if not broker_ids_str:
+        pytest.skip('KAFKA_BROKER_IDS not set; need multi-broker kafka cluster')
+    broker_ids = [int(x) for x in broker_ids_str.split(',')]
+    if len(broker_ids) < 2:
+        pytest.skip('need at least 2 brokers for failover test, got {}'.format(len(broker_ids)))
+
+    host = default_kafka_server
+    all_brokers = ','.join('{h}:909{bid}'.format(h=host, bid=bid) for bid in broker_ids)
+    replication_factor = min(3, len(broker_ids))
+
+    conn = connection()
+    zonegroup = get_config_zonegroup()
+    bucket_name = gen_bucket_name()
+    bucket = conn.create_bucket(bucket_name)
+    topic_name = bucket_name + TOPIC_SUFFIX
+
+    task, receiver = create_kafka_receiver_thread(
+        topic_name, kafka_brokers=all_brokers, replication_factor=replication_factor)
+    task.start()
+    verify_kafka_receiver(receiver)
+
+    endpoint_address = 'kafka://' + '{h}:9092'.format(h=host)
+    endpoint_args = (
+        'push-endpoint=' + endpoint_address
+        + '&kafka-ack-level=broker'
+        + '&kafka-brokers=' + all_brokers
+    )
+    topic_conf = PSTopicS3(conn, topic_name, zonegroup, endpoint_args=endpoint_args)
+    topic_arn = topic_conf.set_config()
+    notification_name = bucket_name + NOTIFICATION_SUFFIX
+    topic_conf_list = [{'Id': notification_name,
+                        'TopicArn': topic_arn,
+                        'Events': []}]
+    s3_notification_conf = PSNotificationS3(conn, bucket_name, topic_conf_list)
+    response, status = s3_notification_conf.set_config()
+    assert status/100 == 2
+
+    num_before = 10
+    client_threads = []
+    objects_size = {}
+    etags = []
+    for i in range(num_before):
+        content = str(os.urandom(1024))
+        etag = hashlib.md5(content.encode()).hexdigest()
+        etags.append(etag)
+        key = bucket.new_key('before-' + str(i))
+        objects_size[key.name] = len(content)
+        thr = threading.Thread(target=set_contents_from_string, args=(key, content,))
+        thr.start()
+        client_threads.append(thr)
+    [thr.join() for thr in client_threads]
+
+    time.sleep(5)
+    keys_before = list(bucket.list())
+    receiver.verify_s3_events(keys_before, exact_match=True, deletions=False,
+                              expected_sizes=objects_size, etags=etags)
+
+    leader_id = get_partition_leader(all_brokers, topic_name)
+    log.info('topic %s partition leader is broker %d – killing it', topic_name, leader_id)
+    kill_broker_hard(leader_id)
+    time.sleep(10)
+
+    num_after = 10
+    client_threads = []
+    for i in range(num_after):
+        content = str(os.urandom(1024))
+        etag = hashlib.md5(content.encode()).hexdigest()
+        etags.append(etag)
+        key = bucket.new_key('after-' + str(i))
+        objects_size[key.name] = len(content)
+        thr = threading.Thread(target=set_contents_from_string, args=(key, content,))
+        thr.start()
+        client_threads.append(thr)
+    [thr.join() for thr in client_threads]
+
+    log.info('waiting for notifications (broker %d is down)...', leader_id)
+    time.sleep(15)
+
+    keys_after = [k for k in bucket.list() if k.name.startswith('after-')]
+    receiver.verify_s3_events(keys_after, exact_match=True, deletions=False,
+                              expected_sizes=objects_size, etags=etags[num_before:])
+
+    log.info('restarting broker %d', leader_id)
+    start_broker(leader_id, wait_secs=10)
+
+    client_threads = []
+    all_keys = list(bucket.list())
+    for key in all_keys:
+        thr = threading.Thread(target=key.delete, args=())
+        thr.start()
+        client_threads.append(thr)
+    [thr.join() for thr in client_threads]
+
+    time.sleep(10)
+    receiver.verify_s3_events(all_keys, exact_match=True, deletions=True,
+                              expected_sizes=objects_size, etags=etags)
+
+    s3_notification_conf.del_config()
+    topic_conf.del_config()
+    conn.delete_bucket(bucket_name)
+    receiver.close(task)
+
+
+@pytest.mark.kafka_failover
+def test_kafka_broker_failover_and_recovery():
+    """ test notification delivery after a non-leader broker is killed and restarted """
+    broker_ids_str = os.environ.get('KAFKA_BROKER_IDS', '')
+    if not broker_ids_str:
+        pytest.skip('KAFKA_BROKER_IDS not set; need multi-broker kafka cluster')
+    broker_ids = [int(x) for x in broker_ids_str.split(',')]
+    if len(broker_ids) < 2:
+        pytest.skip('need at least 2 brokers for failover test, got {}'.format(len(broker_ids)))
+
+    host = default_kafka_server
+    all_brokers = ','.join('{h}:909{bid}'.format(h=host, bid=bid) for bid in broker_ids)
+    replication_factor = min(3, len(broker_ids))
+
+    conn = connection()
+    zonegroup = get_config_zonegroup()
+    bucket_name = gen_bucket_name()
+    bucket = conn.create_bucket(bucket_name)
+    topic_name = bucket_name + TOPIC_SUFFIX
+
+    task, receiver = create_kafka_receiver_thread(
+        topic_name, kafka_brokers=all_brokers, replication_factor=replication_factor)
+    task.start()
+    verify_kafka_receiver(receiver)
+
+    endpoint_address = 'kafka://' + '{h}:9092'.format(h=host)
+    endpoint_args = (
+        'push-endpoint=' + endpoint_address
+        + '&kafka-ack-level=broker'
+        + '&kafka-brokers=' + all_brokers
+    )
+    topic_conf = PSTopicS3(conn, topic_name, zonegroup, endpoint_args=endpoint_args)
+    topic_arn = topic_conf.set_config()
+    notification_name = bucket_name + NOTIFICATION_SUFFIX
+    topic_conf_list = [{'Id': notification_name,
+                        'TopicArn': topic_arn,
+                        'Events': []}]
+    s3_notification_conf = PSNotificationS3(conn, bucket_name, topic_conf_list)
+    response, status = s3_notification_conf.set_config()
+    assert status/100 == 2
+
+    leader_id = get_partition_leader(all_brokers, topic_name)
+    victim_id = [bid for bid in broker_ids if bid != leader_id][0]
+    log.info('topic %s leader is broker %d – killing non-leader broker %d',
+             topic_name, leader_id, victim_id)
+    kill_broker_hard(victim_id)
+    time.sleep(5)
+
+    num_objects = 10
+    client_threads = []
+    objects_size = {}
+    etags = []
+    for i in range(num_objects):
+        content = str(os.urandom(1024))
+        etag = hashlib.md5(content.encode()).hexdigest()
+        etags.append(etag)
+        key = bucket.new_key(str(i))
+        objects_size[key.name] = len(content)
+        thr = threading.Thread(target=set_contents_from_string, args=(key, content,))
+        thr.start()
+        client_threads.append(thr)
+    [thr.join() for thr in client_threads]
+
+    time.sleep(10)
+    keys = list(bucket.list())
+    receiver.verify_s3_events(keys, exact_match=True, deletions=False,
+                              expected_sizes=objects_size, etags=etags)
+
+    log.info('restarting broker %d', victim_id)
+    start_broker(victim_id, wait_secs=10)
+
+    client_threads = []
+    for key in bucket.list():
+        thr = threading.Thread(target=key.delete, args=())
+        thr.start()
+        client_threads.append(thr)
+    [thr.join() for thr in client_threads]
+
+    time.sleep(10)
+    receiver.verify_s3_events(keys, exact_match=True, deletions=True,
+                              expected_sizes=objects_size, etags=etags)
+
+    s3_notification_conf.del_config()
+    topic_conf.del_config()
+    conn.delete_bucket(bucket_name)
+    receiver.close(task)
 
 
 @pytest.mark.manual_test

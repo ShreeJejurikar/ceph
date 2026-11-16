@@ -233,6 +233,10 @@ def run_tests(ctx, config):
         if kafka_dir:
             args.append('KAFKA_DIR={kafka_dir}'.format(kafka_dir=kafka_dir))
 
+        kafka_broker_ids = getattr(ctx, 'kafka_broker_ids', None)
+        if kafka_broker_ids:
+            args.append('KAFKA_BROKER_IDS={ids}'.format(ids=kafka_broker_ids))
+
         # when a KDC has been set up, point the GSSAPI client (the kafka-python
         # consumer used by the tests) at the rgw keytab so it can auto-acquire
         # and auto-renew its kerberos credentials without a separate kinit.

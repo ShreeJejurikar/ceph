@@ -49,7 +49,15 @@ kafka_prefix = 'kafka_2.13-'
 KRAFT_CONTROLLER_PORTS = {
     1: 9097,
     2: 9098,
+    3: 9099,
 }
+
+ZOOKEEPER_BROKER_IDS = (1, 2, 3)
+
+def get_broker_ids(kraft):
+    if kraft:
+        return tuple(KRAFT_CONTROLLER_PORTS)
+    return ZOOKEEPER_BROKER_IDS
 
 def get_kafka_dir(ctx, config):
     kafka_version = get_kafka_version(config)
@@ -189,9 +197,8 @@ def install_kafka(ctx, config):
             # create config for 2 zookeepers
             zookeeper_conf(ctx, client, 1, kafka_dir)
             zookeeper_conf(ctx, client, 2, kafka_dir)
-        # create config for 2 brokers
-        broker_conf(ctx, client, 1, kafka_dir, kraft)
-        broker_conf(ctx, client, 2, kafka_dir, kraft)
+        for broker_id in get_broker_ids(kraft):
+            broker_conf(ctx, client, broker_id, kafka_dir, kraft)
 
         if kraft:
             cluster_id = remote.sh(
@@ -199,19 +206,21 @@ def install_kafka(ctx, config):
                     tdir=kafka_dir)
             ).strip()
             controller_dirs = {
-                1: remote.sh(
+                broker_id: remote.sh(
                     'cd {tdir}/bin && ./kafka-storage.sh random-uuid'.format(
                         tdir=kafka_dir)
-                ).strip(),
-                2: remote.sh(
-                    'cd {tdir}/bin && ./kafka-storage.sh random-uuid'.format(
-                        tdir=kafka_dir)
-                ).strip(),
+                ).strip()
+                for broker_id in get_broker_ids(kraft)
             }
-            initial_controllers = (
-                '1@localhost:9097:{dir1},2@localhost:9098:{dir2}'
-            ).format(dir1=controller_dirs[1], dir2=controller_dirs[2])
-            for broker_id in [1, 2]:
+            initial_controllers = ','.join(
+                '{node_id}@localhost:{port}:{directory}'.format(
+                    node_id=broker_id,
+                    port=KRAFT_CONTROLLER_PORTS[broker_id],
+                    directory=controller_dirs[broker_id],
+                )
+                for broker_id in get_broker_ids(kraft)
+            )
+            for broker_id in get_broker_ids(kraft):
                 ctx.cluster.only(client).run(
                     args=[
                         'cd', '{tdir}/bin'.format(tdir=kafka_dir), run.Raw('&&'),
@@ -238,11 +247,11 @@ def install_kafka(ctx, config):
 
 
 @contextlib.contextmanager
-def run_kafka(ctx,config):
+def run_kafka(ctx, config):
     """
-    Starts two Kafka brokers. In Zookeeper mode (3.x), it also starts two
-    Zookeeper services. In KRaft mode (4.x), each Kafka process is a combined
-    broker/controller.
+    Starts three Kafka brokers in Zookeeper mode (3.x), together with two
+    Zookeeper services. In KRaft mode (4.x), it starts three combined
+    broker/controller nodes.
     """
     assert isinstance(config, dict)
     kraft = is_kraft_mode(get_kafka_version(config))
@@ -281,18 +290,14 @@ def run_kafka(ctx,config):
                     log.info("Checking if Zookeeper %d is started. Result: %s", zk_id, str(result))
                     zk_started = True
 
-        ctx.cluster.only(client).run(
-            args=['cd', '{tdir}/bin'.format(tdir=kafka_dir), run.Raw('&&'),
-             './kafka-server-start.sh', '-daemon',
-             '{tdir}/config/kafka1.properties'.format(tdir=get_kafka_dir(ctx, config))
-            ],
-        )
-        ctx.cluster.only(client).run(
-            args=['cd', '{tdir}/bin'.format(tdir=kafka_dir), run.Raw('&&'),
-             './kafka-server-start.sh', '-daemon',
-             '{tdir}/config/kafka2.properties'.format(tdir=get_kafka_dir(ctx, config))
-            ],
-        )
+        for broker_id in get_broker_ids(kraft):
+            ctx.cluster.only(client).run(
+                args=['cd', '{tdir}/bin'.format(tdir=kafka_dir), run.Raw('&&'),
+                 './kafka-server-start.sh', '-daemon',
+                 '{tdir}/config/kafka{broker_id}.properties'.format(
+                     tdir=kafka_dir, broker_id=broker_id)
+                ],
+            )
         # wait for kafka to start
         time.sleep(5)
 
@@ -305,39 +310,29 @@ def run_kafka(ctx,config):
         for (client, _) in config.items():
             (remote,) = ctx.cluster.only(client).remotes.keys()
 
-            ctx.cluster.only(client).run(
-                args=['cd', '{tdir}/bin'.format(tdir=get_kafka_dir(ctx, config)), run.Raw('&&'),
-                 './kafka-server-stop.sh',
-                 '{tdir}/config/kafka1.properties'.format(tdir=get_kafka_dir(ctx, config)),
-                ],
-            )
+            for broker_id in get_broker_ids(kraft):
+                ctx.cluster.only(client).run(
+                    args=['cd', '{tdir}/bin'.format(tdir=kafka_dir), run.Raw('&&'),
+                     './kafka-server-stop.sh',
+                     '{tdir}/config/kafka{broker_id}.properties'.format(
+                         tdir=kafka_dir, broker_id=broker_id),
+                    ],
+                )
 
-            ctx.cluster.only(client).run(
-                args=['cd', '{tdir}/bin'.format(tdir=get_kafka_dir(ctx, config)), run.Raw('&&'),
-                 './kafka-server-stop.sh',
-                 '{tdir}/config/kafka2.properties'.format(tdir=get_kafka_dir(ctx, config)),
-                ],
-            )
-
-            # wait for kafka to stop
             time.sleep(5)
 
             if not kraft:
-                ctx.cluster.only(client).run(
-                    args=['cd', '{tdir}/bin'.format(tdir=get_kafka_dir(ctx, config)), run.Raw('&&'),
-                     './zookeeper-server-stop.sh',
-                     '{tir}/config/zookeeper1.properties'.format(tir=get_kafka_dir(ctx, config)),
-                    ],
-                )
-                ctx.cluster.only(client).run(
-                    args=['cd', '{tdir}/bin'.format(tdir=get_kafka_dir(ctx, config)), run.Raw('&&'),
-                     './zookeeper-server-stop.sh',
-                     '{tir}/config/zookeeper2.properties'.format(tir=get_kafka_dir(ctx, config)),
-                    ],
-                )
+                for zk_id in [1, 2]:
+                    ctx.cluster.only(client).run(
+                        args=['cd', '{tdir}/bin'.format(tdir=get_kafka_dir(ctx, config)), run.Raw('&&'),
+                         './zookeeper-server-stop.sh',
+                         '{tdir}/config/zookeeper{zk_id}.properties'.format(
+                             tdir=get_kafka_dir(ctx, config), zk_id=zk_id),
+                        ],
+                    )
 
-                # wait for zookeeper to stop
                 time.sleep(5)
+
             ctx.cluster.only(client).run(args=['killall', '-9', 'java'])
 
 
@@ -384,7 +379,7 @@ def run_admin_cmds(ctx, config):
 
 
 @contextlib.contextmanager
-def task(ctx,config):
+def task(ctx, config):
     """
     Following is the way how to run kafka::
     tasks:
@@ -416,9 +411,12 @@ def task(ctx,config):
                 log.info("Kafka version resolved: %s -> %s", raw, resolved)
             client_config['kafka_version'] = resolved
 
-    ctx.kafka_dir = get_kafka_dir(ctx, config)
-
     log.debug('Kafka config is %s', config)
+
+    kafka_dir = get_kafka_dir(ctx, config)
+    kraft = is_kraft_mode(get_kafka_version(config))
+    ctx.kafka_dir = kafka_dir
+    ctx.kafka_broker_ids = ','.join(str(bid) for bid in get_broker_ids(kraft))
 
     with contextutil.nested(
         lambda: install_kafka(ctx=ctx, config=config),
